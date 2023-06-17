@@ -1,0 +1,1183 @@
+<!DOCTYPE html>
+<html lang="en-EN">
+  <head>
+    <meta charset="utf-8" />
+    <title>Ten tac toe</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@100;200;300;400;500;600;700;800;900&family=Nova+Square&display=swap"
+      rel="stylesheet"
+    />
+    <link
+      href="https://cdn.jsdelivr.net/npm/@mdi/font@7.2.96/css/materialdesignicons.min.css"
+      rel="stylesheet"
+    />
+    <script src="https://unpkg.com/peerjs@1.4.7/dist/peerjs.min.js"></script>
+    <script type="text/javascript">
+      //@ts-check
+
+      const SIZE_BASIS = 3;
+
+      /**
+       * @enum {number}
+       * @readonly
+       */
+      const FieldState = {
+        //NOTE: skip 0 to avoid incorrect falsy checks
+        EMPTY: 1,
+        EX: 2,
+        CIRCLE: 3,
+      };
+
+      const exIconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                      <path d="M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z" />
+                    </svg>`;
+      const circleIconSvg = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24">
+                      <path d="M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2Z" />
+                    </svg>`;
+
+      /**
+       * @enum {number}
+       * @readonly
+       */
+      const MessageType = {
+        OPPONENT_MOVED: 0,
+        RESTART_GAME: 1,
+      };
+
+      window.onload = () => {
+        const peerIdElement = document.getElementById("peer-id");
+        const peerIdButton = document.getElementById("peer-id-button");
+        const connectButton = document.getElementById("connect-button");
+        const disconnectButton = document.getElementById("disconnect-button");
+        const connectionForm = document.getElementById("connection-form");
+        const errorInfo = document.getElementById("error-info");
+        if (
+          !peerIdElement ||
+          !peerIdButton ||
+          !connectButton ||
+          !disconnectButton ||
+          !connectionForm ||
+          !errorInfo
+        ) {
+          throw new Error("Page elements not initialized properly");
+        }
+
+        //@ts-ignore
+        const peer = new Peer(undefined, { debug: 0 });
+        peer.on("open", (peerId) => {
+          peerIdElement.innerText = peerId;
+
+          peer.on("connection", (conn) => {
+            startGame(conn, peerId);
+            conn.on("error", endGame);
+            conn.on("close", endGame);
+          });
+
+          peer.on("error", (err) => {
+            console.error(err);
+            errorInfo.innerText =
+              err instanceof Error ? err.message : String(err);
+            endGame();
+          });
+
+          peerIdButton.addEventListener("click", () => {
+            if (!peerIdElement) throw new Error("Peer ID element not found");
+            navigator.clipboard.writeText(peerIdElement.innerText);
+          });
+          connectButton.addEventListener("click", () => {
+            const peerIdInput = document.getElementById("peer-id-input");
+            if (!peerIdInput) throw new Error("Peer ID input not found");
+
+            /** @type {string} */
+            //@ts-ignore
+            const targetPeerId = peerIdInput.value.trim();
+
+            if (!targetPeerId) return;
+
+            const conn = peer.connect(targetPeerId, {
+              metadata: {
+                startingPlayer: Math.random() < 0.5 ? peerId : targetPeerId,
+              },
+              reliable: true,
+            });
+            conn.on("open", () => {
+              try {
+                //@ts-ignore
+                peerIdInput.value = "";
+              } catch (e) {
+                console.error(e);
+              }
+              startGame(conn, peerId);
+            });
+            conn.on("error", endGame);
+            conn.on("close", endGame);
+          });
+          disconnectButton.addEventListener("click", () => {
+            endGame();
+          });
+        });
+
+        function endGame() {
+          if (!connectionForm) throw new Error("Connection form not found");
+          connectionForm.style.display = "flex";
+
+          TenTacToe.destroy();
+        }
+
+        /**
+         * @param {any} connection
+         * @param {string} peerId
+         * */
+        function startGame(connection, peerId) {
+          endGame();
+
+          if (!errorInfo) throw new Error("Error info element not found");
+          errorInfo.innerText = "";
+
+          if (!connectionForm) throw new Error("Connection form not found");
+          connectionForm.style.display = "none";
+
+          new TenTacToe(connection, peerId);
+        }
+      };
+
+      class TenTacToe {
+        /** @type {TenTacToe | null} */
+        static #instance = null;
+
+        static destroy() {
+          if (TenTacToe.#instance) {
+            TenTacToe.#instance.#destroy();
+            TenTacToe.#instance = null;
+          }
+        }
+
+        #connection;
+        #selfMove = false;
+        /** @type {[number, number] | null} */
+        #nextLocalBoard = null;
+        /** @type {FieldState} */
+        #selfSymbol;
+        /** @type {FieldState} */
+        #enemySymbol;
+
+        #gameContainer = document.getElementById("game-container");
+        #opponentId = document.getElementById("opponent-id");
+        #gameBoard = document.getElementById("game-board");
+        #playerMoveInfo = document.getElementById("player-move-info");
+        #playAgainButton = document.getElementById("play-again-button");
+
+        /** @type {LocalBoard[][]} */
+        #globalBoard = [];
+
+        //NOTE: FieldState.EMPTY means draw
+        /** @type {FieldState | null} */
+        #completed = null;
+
+        /**
+         * @param {any} connection
+         * @param {string} peerId
+         * */
+        constructor(connection, peerId) {
+          if (TenTacToe.#instance) {
+            throw new Error("TenTacToe already instantiated");
+          }
+          TenTacToe.#instance = this;
+
+          const startingPlayer = connection.metadata.startingPlayer;
+          this.#connection = connection;
+          this.#selfMove = startingPlayer === peerId;
+          this.#selfSymbol = this.#selfMove ? FieldState.EX : FieldState.CIRCLE;
+          this.#enemySymbol = this.#selfMove
+            ? FieldState.CIRCLE
+            : FieldState.EX;
+
+          this.#connection.on("data", (data) => this.#handleMessage(data));
+
+          if (!this.#opponentId)
+            throw new Error("Opponent ID element not found");
+          this.#opponentId.innerText = this.#connection.peer;
+
+          if (!this.#gameContainer) throw new Error("Game container not found");
+          this.#gameContainer.style.display = "flex";
+
+          this.#initGame();
+        }
+
+        #destroy() {
+          this.#connection.close();
+          if (!this.#gameContainer) throw new Error("Game container not found");
+          this.#gameContainer.style.display = "none";
+        }
+
+        #initGame() {
+          if (!this.#gameBoard) {
+            throw new Error("Game board not found");
+          }
+
+          this.#gameBoard.innerText = "";
+          this.#gameBoard.style.display = "grid";
+          this.#gameBoard.style.gridTemplateColumns = `repeat(${SIZE_BASIS}, 1fr)`;
+          this.#gameBoard.style.gridTemplateRows = `repeat(${SIZE_BASIS}, 1fr)`;
+          this.#gameBoard.style.gap = "0.25rem";
+          this.#gameBoard.classList.remove("finished");
+
+          this.#updatePlayerMoveInfo();
+
+          if (!this.#playAgainButton) {
+            throw new Error("Play again button not found");
+          }
+          this.#playAgainButton.style.display = "none";
+          this.#playAgainButton.onclick = () => {
+            this.#initGame();
+            this.#connection.send({
+              type: MessageType.RESTART_GAME,
+            });
+          };
+
+          this.#completed = null;
+          this.#nextLocalBoard = null;
+
+          this.#globalBoard = Array.from({ length: SIZE_BASIS }, (_, y) =>
+            Array.from({ length: SIZE_BASIS }, (_, x) => {
+              if (!this.#gameBoard) throw new Error("Game board not found");
+              return new LocalBoard(
+                this.#gameBoard,
+                x,
+                y,
+                this.#selfSymbol,
+                this.#enemySymbol
+              );
+            })
+          );
+
+          this.#forEachField((field, globalX, globalY, localX, localY) => {
+            field.setState(FieldState.EMPTY, this.#selfMove);
+
+            field.onClick = () => {
+              this.#handleMove(globalX, globalY, localX, localY, true);
+            };
+          });
+        }
+
+        /**
+         * @param {(localBoard: LocalBoard, globalX: number, globalY: number) => void} callback
+         */
+        #forEachLocalBoard(callback) {
+          this.#globalBoard.forEach((row, globalY) =>
+            row.forEach((localBoard, globalX) => {
+              callback(localBoard, globalX, globalY);
+            })
+          );
+        }
+
+        /**
+         * @param {(field: Field, globalX: number, globalY: number, localY: number, localX: number) => void} callback
+         */
+        #forEachField(callback) {
+          this.#forEachLocalBoard((localBoard, globalX, globalY) => {
+            localBoard.fields.forEach((localBoardRow, localX) =>
+              localBoardRow.forEach((field, localY) => {
+                callback(field, globalX, globalY, localY, localX);
+              })
+            );
+          });
+        }
+
+        /**
+         * @param {number} globalX
+         * @param {number} globalY
+         * @returns {LocalBoard}
+         */
+        #getLocalBoard(globalX, globalY) {
+          return this.#globalBoard[globalY][globalX];
+        }
+
+        /**
+         * @param {number} globalX
+         * @param {number} globalY
+         * @param {number} localX
+         * @param {number} localY
+         * @returns {Field}
+         */
+        #getField(globalX, globalY, localX, localY) {
+          return this.#getLocalBoard(globalX, globalY).getField(localX, localY);
+        }
+
+        /**
+         * @param {number} globalX
+         * @param {number} globalY
+         * @param {number} localX
+         * @param {number} localY
+         * @param {boolean} selfMove
+         */
+        #handleMove(globalX, globalY, localX, localY, selfMove) {
+          const localBoard = this.#getLocalBoard(globalX, globalY);
+          if (localBoard.completed) {
+            return;
+          }
+
+          const field = this.#getField(globalX, globalY, localX, localY);
+          if (field.state !== FieldState.EMPTY || selfMove !== this.#selfMove) {
+            return;
+          }
+
+          if (selfMove) {
+            this.#connection.send({
+              type: MessageType.OPPONENT_MOVED,
+              globalX,
+              globalY,
+              localX,
+              localY,
+            });
+          }
+
+          field.setState(
+            selfMove ? this.#selfSymbol : this.#enemySymbol,
+            selfMove
+          );
+
+          this.#selfMove = !selfMove;
+          this.#updatePlayerMoveInfo();
+
+          this.#forEachField((field, globalX, globalY, localX, localY) => {
+            if (field.state === FieldState.EMPTY) {
+              field.setState(FieldState.EMPTY, this.#selfMove);
+            }
+          });
+
+          this.#forEachLocalBoard((localBoard) => localBoard.check());
+
+          const gameFinished = this.#check();
+
+          if (gameFinished) {
+            if (
+              !this.#gameBoard ||
+              !this.#playerMoveInfo ||
+              !this.#playAgainButton
+            ) {
+              throw new Error(
+                "Cannot finish game due to incorrect DOM structure"
+              );
+            }
+            this.#gameBoard.classList.add("finished");
+            this.#playerMoveInfo.innerText =
+              this.#completed === this.#selfSymbol ? "You won!" : "You lost!";
+            this.#playAgainButton.style.display = "block";
+            this.#nextLocalBoard = null;
+            return;
+          }
+
+          const nextLocalBoard = this.#getLocalBoard(localX, localY);
+          if (nextLocalBoard.completed !== null) {
+            this.#nextLocalBoard = null;
+            this.#forEachLocalBoard((localBoard) =>
+              localBoard.setLocked(false)
+            );
+          } else {
+            this.#nextLocalBoard = [localX, localY];
+            this.#forEachLocalBoard((localBoard) =>
+              localBoard.setLocked(localBoard !== nextLocalBoard)
+            );
+          }
+        }
+
+        /**
+         * @param {{type: MessageType, [_: string]: any}} message
+         */
+        #handleMessage(message) {
+          switch (message.type) {
+            case MessageType.OPPONENT_MOVED:
+              this.#handleMove(
+                message.globalX,
+                message.globalY,
+                message.localX,
+                message.localY,
+                false
+              );
+              break;
+            case MessageType.RESTART_GAME:
+              this.#initGame();
+              break;
+          }
+        }
+
+        #updatePlayerMoveInfo() {
+          if (!this.#playerMoveInfo) {
+            throw new Error("Player move info element not found");
+          }
+          this.#playerMoveInfo.innerHTML = this.#selfMove
+            ? `Your move (<span class="mdi ${
+                this.#selfSymbol === FieldState.CIRCLE
+                  ? "mdi-circle-outline"
+                  : "mdi-close"
+              }"></span>)`
+            : `Opponent's move (<span class="mdi ${
+                this.#enemySymbol === FieldState.CIRCLE
+                  ? "mdi-circle-outline"
+                  : "mdi-close"
+              }"></span>)`;
+        }
+
+        /** @returns {boolean} */
+        #check() {
+          if (this.#completed !== null) {
+            return true;
+          }
+
+          const lastIndex = SIZE_BASIS - 1;
+
+          // Check rows
+          for (let y = 0; y < SIZE_BASIS; y++) {
+            if (this.#getLocalBoard(0, y).completed === null) {
+              continue;
+            }
+            let rowCompleted = true;
+            for (let x = 1; x < SIZE_BASIS; x++) {
+              if (
+                this.#getLocalBoard(x, y).completed !==
+                this.#getLocalBoard(0, y).completed
+              ) {
+                rowCompleted = false;
+                break;
+              }
+            }
+            if (rowCompleted) {
+              this.#completed = this.#getLocalBoard(0, y).completed;
+              return true;
+            }
+          }
+
+          // Check columns
+          for (let x = 0; x < SIZE_BASIS; x++) {
+            if (this.#getLocalBoard(x, 0).completed === null) {
+              continue;
+            }
+            let columnCompleted = true;
+            for (let y = 1; y < SIZE_BASIS; y++) {
+              if (
+                this.#getLocalBoard(x, y).completed !==
+                this.#getLocalBoard(x, 0).completed
+              ) {
+                columnCompleted = false;
+                break;
+              }
+            }
+            if (columnCompleted) {
+              this.#completed = this.#getLocalBoard(x, 0).completed;
+              return true;
+            }
+          }
+
+          // Check diagonals
+          if (this.#getLocalBoard(0, 0).completed !== null) {
+            let diagonalCompleted = true;
+            for (let i = 1; i < SIZE_BASIS; i++) {
+              if (
+                this.#getLocalBoard(i, i).completed !==
+                this.#getLocalBoard(0, 0).completed
+              ) {
+                diagonalCompleted = false;
+                break;
+              }
+            }
+            if (diagonalCompleted) {
+              this.#completed = this.#getLocalBoard(0, 0).completed;
+              return true;
+            }
+          }
+
+          if (this.#getLocalBoard(lastIndex, 0).completed !== null) {
+            let diagonalCompleted = true;
+            for (let i = 1; i < SIZE_BASIS; i++) {
+              if (
+                this.#getLocalBoard(lastIndex - i, i).completed !==
+                this.#getLocalBoard(lastIndex, 0).completed
+              ) {
+                diagonalCompleted = false;
+                break;
+              }
+            }
+            if (diagonalCompleted) {
+              this.#completed = this.#getLocalBoard(lastIndex, 0).completed;
+              return true;
+            }
+          }
+
+          // Check for draw
+          let draw = true;
+          for (let x = 0; x < SIZE_BASIS; x++) {
+            for (let y = 0; y < SIZE_BASIS; y++) {
+              if (this.#getLocalBoard(x, y).completed === null) {
+                draw = false;
+                break;
+              }
+            }
+            if (!draw) {
+              break;
+            }
+          }
+          if (draw) {
+            this.#completed = FieldState.EMPTY;
+            return true;
+          }
+
+          this.#completed = null;
+          return false;
+        }
+      }
+
+      class LocalBoard {
+        /** @type {HTMLElement} */
+        #gridElement;
+        /** @type {Field[][]} */
+        fields;
+
+        //NOTE: FieldState.EMPTY means draw
+        /** @type {FieldState | null} */
+        #completed = null;
+
+        /** @type {FieldState} */
+        #selfSymbol;
+        /** @type {FieldState} */
+        #enemySymbol;
+
+        /**
+         * @param {HTMLElement} boardElement
+         * @param {number} x
+         * @param {number} y
+         * @param {FieldState} selfSymbol
+         * @param {FieldState} enemySymbol
+         * */
+        constructor(boardElement, x, y, selfSymbol, enemySymbol) {
+          this.#selfSymbol = selfSymbol;
+          this.#enemySymbol = enemySymbol;
+
+          this.#gridElement = document.createElement("div");
+          this.#gridElement.classList.add("local-board");
+          this.#gridElement.style.gridTemplateColumns = `repeat(${SIZE_BASIS}, 1fr)`;
+          this.#gridElement.style.gridTemplateRows = `repeat(${SIZE_BASIS}, 1fr)`;
+          this.#gridElement.style.transformOrigin = `${
+            x === 0 ? "left" : x === SIZE_BASIS - 1 ? "right" : "center"
+          } ${y === 0 ? "top" : y === SIZE_BASIS - 1 ? "bottom" : "center"}`;
+
+          boardElement.appendChild(this.#gridElement);
+
+          this.fields = Array.from({ length: SIZE_BASIS }, () =>
+            Array.from(
+              { length: SIZE_BASIS },
+              () => new Field(this.#gridElement)
+            )
+          );
+        }
+
+        get completed() {
+          return this.#completed;
+        }
+
+        /**
+         * @param {FieldState | null} state
+         * @param {[number, number]} [from]
+         * @param {[number, number]} [to]
+         */
+        #setCompleted(state, from, to) {
+          this.#completed = state;
+          if (state !== null) {
+            if (from && to) {
+              this.#drawStrikeThrough(state, from, to);
+            }
+            if (state === this.#enemySymbol || state === this.#selfSymbol) {
+              this.#drawGlobalBoardSymbol(state);
+            }
+            this.#gridElement.classList.add("completed");
+          } else {
+            this.#gridElement.classList.remove("completed");
+          }
+        }
+
+        /** @param {FieldState} state */
+        #drawGlobalBoardSymbol(state) {
+          const symbolElement = document.createElement("div");
+          symbolElement.classList.add(
+            "global-board-symbol",
+            state === this.#selfSymbol ? "self" : "enemy"
+          );
+
+          const icon = state === FieldState.EX ? exIconSvg : circleIconSvg;
+          symbolElement.innerHTML = icon;
+
+          this.#gridElement.appendChild(symbolElement);
+        }
+
+        /**
+         * @param {FieldState} state
+         * @param {[number, number]} from
+         * @param {[number, number]} to
+         */
+        #drawStrikeThrough(state, from, to) {
+          const x = (from[0] + to[0] + 1) / 2 / SIZE_BASIS;
+          const y = (from[1] + to[1] + 1) / 2 / SIZE_BASIS;
+          const len =
+            Math.sqrt((from[0] - to[0]) ** 2 + (from[1] - to[1]) ** 2) /
+            SIZE_BASIS;
+          const angle =
+            Math.atan2(to[1] - from[1], to[0] - from[0]) + Math.PI / 2;
+
+          const strikeThroughElement = document.createElement("div");
+          strikeThroughElement.classList.add(
+            "strike-through",
+            state === FieldState.EMPTY
+              ? "draw"
+              : state === this.#selfSymbol
+              ? "self"
+              : "enemy"
+          );
+          const width = (100 / SIZE_BASIS) * 0.125;
+          strikeThroughElement.style.width = `${width}%`;
+          strikeThroughElement.style.height = `${100 * len}%`;
+          strikeThroughElement.style.left = `${100 * x}%`;
+          strikeThroughElement.style.top = `${100 * y}%`;
+          strikeThroughElement.style.transform = `translate(-50%, -50%) rotate(${
+            (angle * 180) / Math.PI
+          }deg)`;
+
+          this.#gridElement.appendChild(strikeThroughElement);
+        }
+
+        /**
+         * @param {number} x
+         * @param {number} y
+         * @returns {Field}
+         */
+        getField(x, y) {
+          return this.fields[y][x];
+        }
+
+        check() {
+          if (this.#completed !== null) {
+            return;
+          }
+
+          const lastIndex = SIZE_BASIS - 1;
+
+          // Check rows
+          for (let y = 0; y < SIZE_BASIS; y++) {
+            if (this.getField(0, y).state === FieldState.EMPTY) {
+              continue;
+            }
+            let rowCompleted = true;
+            for (let x = 1; x < SIZE_BASIS; x++) {
+              if (this.getField(x, y).state !== this.getField(0, y).state) {
+                rowCompleted = false;
+                break;
+              }
+            }
+            if (rowCompleted) {
+              this.#setCompleted(
+                this.getField(0, y).state,
+                [0, y],
+                [lastIndex, y]
+              );
+              return;
+            }
+          }
+
+          // Check columns
+          for (let x = 0; x < SIZE_BASIS; x++) {
+            if (this.getField(x, 0).state === FieldState.EMPTY) {
+              continue;
+            }
+            let columnCompleted = true;
+            for (let y = 1; y < SIZE_BASIS; y++) {
+              if (this.getField(x, y).state !== this.getField(x, 0).state) {
+                columnCompleted = false;
+                break;
+              }
+            }
+            if (columnCompleted) {
+              this.#setCompleted(
+                this.getField(x, 0).state,
+                [x, 0],
+                [x, lastIndex]
+              );
+              return;
+            }
+          }
+
+          // Check diagonals
+          if (this.getField(0, 0).state !== FieldState.EMPTY) {
+            let diagonalCompleted = true;
+            for (let i = 1; i < SIZE_BASIS; i++) {
+              if (this.getField(i, i).state !== this.getField(0, 0).state) {
+                diagonalCompleted = false;
+                break;
+              }
+            }
+            if (diagonalCompleted) {
+              this.#setCompleted(
+                this.getField(0, 0).state,
+                [0, 0],
+                [lastIndex, lastIndex]
+              );
+              return;
+            }
+          }
+
+          if (this.getField(lastIndex, 0).state !== FieldState.EMPTY) {
+            let diagonalCompleted = true;
+            for (let i = 1; i < SIZE_BASIS; i++) {
+              if (
+                this.getField(lastIndex - i, i).state !==
+                this.getField(lastIndex, 0).state
+              ) {
+                diagonalCompleted = false;
+                break;
+              }
+            }
+            if (diagonalCompleted) {
+              this.#setCompleted(
+                this.getField(lastIndex, 0).state,
+                [lastIndex, 0],
+                [0, lastIndex]
+              );
+              return;
+            }
+          }
+
+          // Check for draw
+          let draw = true;
+          for (let x = 0; x < SIZE_BASIS; x++) {
+            for (let y = 0; y < SIZE_BASIS; y++) {
+              if (this.getField(x, y).state === FieldState.EMPTY) {
+                draw = false;
+                break;
+              }
+            }
+            if (!draw) {
+              break;
+            }
+          }
+          if (draw) {
+            this.#setCompleted(FieldState.EMPTY);
+            return;
+          }
+
+          this.#setCompleted(null);
+        }
+
+        /** @param {boolean} locked */
+        setLocked(locked) {
+          if (locked) {
+            this.#gridElement.classList.add("locked");
+          } else {
+            this.#gridElement.classList.remove("locked");
+          }
+        }
+      }
+
+      class Field {
+        /** @type {HTMLElement} */
+        #element;
+        /** @type {FieldState} */
+        #state = FieldState.EMPTY;
+        /** @type {(field: Field) => void} */
+        onClick = () => {};
+
+        /**
+         * @param {HTMLElement} localBoardElement
+         * */
+        constructor(localBoardElement) {
+          this.#element = document.createElement("div");
+          this.#element.classList.add("field");
+          this.#element.onclick = () => this.onClick(this);
+
+          localBoardElement.appendChild(this.#element);
+        }
+
+        get state() {
+          return this.#state;
+        }
+
+        get element() {
+          return this.#element;
+        }
+
+        /**
+         * @param {FieldState} state
+         * @param {boolean} selfMove
+         * */
+        setState(state, selfMove) {
+          this.#state = state;
+
+          this.#element.className = "field";
+
+          switch (state) {
+            case FieldState.EMPTY:
+              {
+                this.#element.innerHTML = "";
+                if (selfMove) {
+                  this.#element.classList.add("idle");
+                }
+              }
+              break;
+            case FieldState.EX:
+            case FieldState.CIRCLE:
+              {
+                const icon =
+                  state === FieldState.EX ? exIconSvg : circleIconSvg;
+
+                this.#element.innerHTML = icon;
+                if (!selfMove) {
+                  this.#element.classList.add("enemy");
+                }
+              }
+              break;
+          }
+        }
+      }
+    </script>
+    <style>
+      :root {
+        --cyan-50: #e0f7fa;
+        --cyan-100: #b2ebf2;
+        --cyan-200: #80deea;
+        --cyan-300: #4dd0e1;
+        --cyan-400: #26c6da;
+        --cyan-500: #00bcd4;
+        --cyan-600: #00acc1;
+        --cyan-700: #0097a7;
+        --cyan-800: #00838f;
+        --cyan-900: #006064;
+
+        --complementary-50: #fae3e0;
+        --complementary-100: #f2b9b2;
+        --complementary-200: #ea8c80;
+        --complementary-300: #e15e4d;
+        --complementary-400: #da3a26;
+        --complementary-500: #d41800;
+        --complementary-600: #c11500;
+        --complementary-700: #a71000;
+        --complementary-800: #8f0c00;
+        --complementary-900: #640400;
+
+        --grid-color: #263238;
+        --error-text-color: #ef9a9a;
+        --hover-color: var(--cyan-100);
+
+        --shadow-1: 0 2px 4px #0004;
+
+        --transition-1: 0.2s ease-in-out;
+        --transition-2: 0.4s ease-in-out;
+
+        --max-board-size: 32rem;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        font-size: 16px;
+        font-family: "Nova Square", Inter, cursive;
+        background-color: var(--cyan-900);
+        color: var(--cyan-50);
+        text-align: center;
+      }
+
+      body {
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        align-items: stretch;
+      }
+
+      main {
+        flex-grow: 1;
+        display: flex;
+        flex-direction: column;
+      }
+
+      footer {
+        font-size: 0.75rem;
+        font-weight: 100;
+        padding: 0.5rem;
+        display: grid;
+        grid-template-columns: 1fr auto 1fr;
+        align-items: center;
+        justify-content: space-between;
+      }
+
+      footer > *:first-child {
+        justify-self: flex-start;
+      }
+
+      footer > *:last-child {
+        justify-self: flex-end;
+      }
+
+      #game-board-container {
+        width: 100%;
+        flex-grow: 1;
+        overflow: hidden;
+        position: relative;
+      }
+
+      #game-board {
+        position: absolute;
+        left: 0;
+        right: 0;
+        top: 0;
+        bottom: 0;
+        margin-inline: auto;
+        margin-bottom: auto;
+        max-width: var(--max-board-size);
+        max-height: 100%;
+        aspect-ratio: 1 / 1;
+
+        background-color: var(--grid-color);
+      }
+      #game-board.finished {
+        pointer-events: none;
+      }
+
+      .local-board {
+        position: relative;
+        display: grid;
+        gap: 0.0625rem;
+        align-items: stretch;
+        justify-content: stretch;
+        border: 0.5rem solid var(--cyan-900);
+        transition: filter var(--transition-1), opacity var(--transition-1),
+          transform var(--transition-1);
+        animation: entry-animation var(--transition-2);
+      }
+
+      .local-board.locked,
+      .local-board.completed {
+        pointer-events: none !important;
+        filter: grayscale(0.5);
+        transform: scale(0.99);
+      }
+      .local-board.completed > .field > svg,
+      .local-board.completed > .strike-through {
+        opacity: 0.75;
+        filter: blur(2px);
+      }
+
+      .strike-through {
+        position: absolute;
+        border-radius: var(--max-board-size);
+      }
+      .strike-through.self {
+        background-color: var(--cyan-200);
+      }
+      .strike-through.enemy {
+        background-color: var(--complementary-200);
+      }
+
+      .global-board-symbol {
+        fill: var(--cyan-200);
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        right: 0;
+        align-items: center;
+        justify-content: center;
+        filter: saturate(2);
+        animation: entry-animation var(--transition-2);
+      }
+
+      .field {
+        background-color: var(--cyan-900);
+        overflow: hidden;
+        position: relative;
+        fill: var(--cyan-200);
+      }
+
+      .field.enemy,
+      .global-board-symbol.enemy {
+        fill: var(--complementary-200);
+      }
+
+      .field.idle {
+        cursor: pointer;
+        transition: background-color var(--transition-1);
+      }
+
+      .field.idle:hover {
+        background-color: var(--cyan-800);
+      }
+
+      .field > * {
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        right: 0;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        animation: entry-animation var(--transition-2);
+      }
+
+      #error-info {
+        color: var(--error-text-color);
+        font-weight: bold;
+      }
+
+      a,
+      a:visited {
+        color: currentColor;
+      }
+
+      button,
+      a {
+        background-color: transparent;
+        border: none;
+        cursor: pointer;
+        color: currentColor;
+        margin: 0;
+        padding: 0;
+        font-weight: bold;
+        font-size: inherit;
+
+        transition: color var(--transition-1),
+          background-color var(--transition-1);
+      }
+
+      button:hover,
+      a:hover {
+        color: var(--hover-color);
+      }
+
+      button > .mdi,
+      a > .mdi {
+        margin-left: 0.35rem;
+      }
+
+      button.contained {
+        background-color: var(--cyan-800);
+        border: 2px solid var(--cyan-700);
+        box-shadow: var(--shadow-1);
+        border-radius: 0.5rem;
+        color: var(--cyan-50);
+        padding: 0.5rem;
+        text-align: center;
+        outline: none;
+      }
+
+      button.contained:hover {
+        background-color: var(--cyan-700);
+        color: #fff;
+      }
+
+      input {
+        background-color: var(--cyan-800);
+        border: 2px solid var(--cyan-700);
+        box-shadow: var(--shadow-1) inset;
+        border-radius: 0.5rem;
+        color: currentColor;
+        font-size: 1rem;
+        font-weight: 100;
+        padding: 0.5rem;
+        text-align: center;
+        outline: none;
+      }
+
+      input::placeholder {
+        color: var(--cyan-50);
+        opacity: 0.5;
+      }
+
+      .stack {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+      }
+
+      .row {
+        flex-direction: row;
+      }
+
+      .gap-1 {
+        gap: 1rem;
+      }
+
+      @keyframes entry-animation {
+        from {
+          transform-origin: center;
+          opacity: 0;
+          transform: scale(0.618);
+        }
+        to {
+          transform-origin: center;
+          opacity: 1;
+          transform: scale(1);
+        }
+      }
+    </style>
+  </head>
+
+  <body>
+    <header>
+      <h2>Ten tac toe</h2>
+      <h4>
+        Your&nbsp;ID:
+        <button id="peer-id-button">
+          <span id="peer-id">Connecting...</span
+          ><span class="mdi mdi-content-copy" />
+        </button>
+      </h4>
+    </header>
+    <main>
+      <div id="connection-form" class="stack gap-1">
+        <input
+          id="peer-id-input"
+          style="min-width: 20rem; max-width: 100%"
+          placeholder="Opponent ID"
+        />
+        <button id="connect-button" class="contained">
+          Challenge opponent<span class="mdi mdi-lan-connect"></span>
+        </button>
+        <div id="error-info"></div>
+      </div>
+      <div
+        id="game-container"
+        class="stack gap-1"
+        style="display: none; flex-grow: 1"
+      >
+        <h4 style="margin-block: 0">
+          Opponent&nbsp;ID: <span id="opponent-id">-</span>
+        </h4>
+        <div id="player-move-info" class="stack row"></div>
+        <button id="play-again-button" class="contained" style="display: none">
+          Play again<span class="mdi mdi-play"></span>
+        </button>
+        <div id="game-board-container">
+          <div id="game-board"></div>
+        </div>
+        <button id="disconnect-button" class="contained">
+          Close game<span class="mdi mdi-close"></span>
+        </button>
+      </div>
+    </main>
+    <footer>
+      <span>v1.0</span>
+      <span
+        >Rules:
+        <a
+          href="https://en.wikipedia.org/wiki/Ultimate_tic-tac-toe#Rules"
+          target="_blank"
+          >Wikipedia<span class="mdi mdi-open-in-new"></span></a
+      ></span>
+      <span
+        >Author:
+        <strong
+          ><a href="https://github.com/Aktyn" target="_blank"
+            >Aktyn<span class="mdi mdi-github"></span></a></strong
+      ></span>
+    </footer>
+  </body>
+</html>
